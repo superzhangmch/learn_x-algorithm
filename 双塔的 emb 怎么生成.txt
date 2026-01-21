@@ -1,0 +1,275 @@
+
+  Embeddings 获取流程
+
+  📊 整体架构
+
+  # 两阶段流程
+  ID/Hash → Embedding Lookup → Model Input
+
+  例子:
+  user_id=123456789 → hash函数 → [hash1, hash2] → 查表 → [emb1, emb2] → 融合 → user_embedding
+
+  ---
+  1️⃣ User Embeddings - Hash-based Lookup
+
+  代码位置: runners.py:421-423 + recsys_model.py:79-119
+
+  步骤 1: 生成 Hash 值
+
+  # runners.py:421-423
+  user_hashes = rng.integers(
+      1, num_user_embeddings,  # 1 到 100000
+      size=(batch_size, num_user_hashes)  # [B, 2]
+  ).astype(np.int32)
+
+  # 示例输出:
+  user_hashes = [
+      [12345, 67890],  # User 0 的2个hash值
+      [11111, 22222],  # User 1 的2个hash值
+  ]  # Shape: [2, 2]
+
+  步骤 2: Embedding Table Lookup
+
+  # 假设有一个全局的 embedding table
+  user_embedding_table = [
+      [0.1, 0.2, ..., 0.8],  # embedding for hash=0 (padding)
+      [0.3, 0.4, ..., 0.9],  # embedding for hash=1
+      ...
+      [0.5, 0.6, ..., 0.7],  # embedding for hash=100000
+  ]  # Shape: [100000, D]
+
+  # 查表操作 (自动在训练框架中完成)
+  user_embeddings = embedding_table[user_hashes]
+  # Shape: [B, num_user_hashes, D] = [2, 2, 128]
+
+  实际代码中的示例（runners.py:472）：
+  embeddings = RecsysEmbeddings(
+      user_embeddings=rng.normal(
+          size=(batch_size, num_user_hashes, emb_size)
+      ).astype(np.float32),
+      # Shape: [B, 2, 128] - 每个用户有2个hash embeddings
+      ...
+  )
+
+  步骤 3: 融合多个 Hash Embeddings
+
+  # recsys_model.py:79-119
+  def block_user_reduce(user_hashes, user_embeddings, ...):
+      """
+      输入:
+          user_embeddings: [B, num_user_hashes, D] = [B, 2, 128]
+
+      处理:
+          1. Reshape: [B, 2, 128] → [B, 1, 256]
+          2. Linear projection: [B, 1, 256] → [B, 1, 128]
+
+      输出:
+          user_embedding: [B, 1, D] = [B, 1, 128]
+      """
+      B, _, D = user_embeddings.shape
+
+      # 拼接多个hash embeddings
+      user_embedding = user_embeddings.reshape((B, 1, num_user_hashes * D))
+      # [B, 1, 2*128] = [B, 1, 256]
+
+      # 投影回 D 维
+      proj_mat = get_parameter("proj_mat_1", [256, 128])
+      user_embedding = Linear(D)(user_embedding)
+      # [B, 1, 128]
+
+      return user_embedding  # [B, 1, D]
+
+  ---
+  2️⃣ Action Embeddings - Learnable Projection
+
+  代码位置: recsys_retrieval_model.py:161-184
+
+  输入：Multi-hot Action Vector
+
+  # runners.py:202-222 定义了19种行为类型
+  ACTIONS = [
+      "favorite_score",      # 0: 点赞
+      "reply_score",         # 1: 回复
+      "repost_score",        # 2: 转发
+      "photo_expand_score",  # 3: 展开图片
+      "click_score",         # 4: 点击详情
+      ...
+      "report_score",        # 17: 举报
+      "dwell_time",          # 18: 停留时长
+  ]  # 总共 19 种
+
+  # 用户的某次历史行为 - Multi-hot vector
+  history_actions[0, 5] = [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  #                        ↑     ↑
+  #                     点赞了  转发了
+  # Shape: [B, S, 19]
+
+  Action Embedding 生成
+
+  # recsys_retrieval_model.py:161-184
+  def _get_action_embeddings(self, actions: jax.Array) -> jax.Array:
+      """Convert multi-hot action vectors to embeddings.
+
+      Args:
+          actions: [B, S, num_actions] - multi-hot vectors
+                   例如: [B, 32, 19]
+
+      Returns:
+          action_emb: [B, S, D] - action embeddings
+      """
+      _, _, num_actions = actions.shape  # 19
+      D = config.emb_size  # 128
+
+      # 可学习的投影矩阵
+      action_projection = get_parameter(
+          "action_projection",
+          [num_actions, D],  # [19, 128]
+          init=VarianceScaling(1.0, mode="fan_out")
+      )
+
+      # 将 [0, 1] 转换为 [-1, 1]
+      actions_signed = (2 * actions - 1).astype(jnp.float32)
+      # [1, 0, 1, 0, ...] → [1, -1, 1, -1, ...]
+
+      # 矩阵乘法: [B, S, 19] @ [19, 128] → [B, S, 128]
+      action_emb = dot(actions_signed, action_projection)
+
+      # 掩码：如果没有任何行为，则embedding为0
+      valid_mask = any(actions, axis=-1, keepdims=True)
+      action_emb = action_emb * valid_mask
+
+      return action_emb  # [B, S, D]
+
+  ---
+  3️⃣ Post & Author Embeddings - 同样是 Hash Lookup
+
+  # runners.py:425-438
+  # Post hashes
+  history_post_hashes = rng.integers(
+      1, num_post_embeddings,  # 1 到 100000
+      size=(batch_size, history_len, num_item_hashes)
+  ).astype(np.int32)
+  # Shape: [B, S, 2] - 每条推文用2个hash
+
+  # Author hashes
+  history_author_hashes = rng.integers(
+      1, num_author_embeddings,  # 1 到 100000
+      size=(batch_size, history_len, num_author_hashes)
+  ).astype(np.int32)
+  # Shape: [B, S, 2] - 每个作者用2个hash
+
+  # Embedding lookup (自动完成)
+  history_post_embeddings = post_embedding_table[history_post_hashes]
+  # Shape: [B, S, 2, D] = [B, 32, 2, 128]
+
+  history_author_embeddings = author_embedding_table[history_author_hashes]
+  # Shape: [B, S, 2, D] = [B, 32, 2, 128]
+
+  ---
+  4️⃣ Product Surface Embeddings - Lookup Table
+
+  # recsys_retrieval_model.py:186-204
+  def _single_hot_to_embeddings(self, input, vocab_size, emb_size, name):
+      """Convert single-hot indices to embeddings via lookup table.
+
+      Args:
+          input: [B, S] - surface indices (0-15)
+          vocab_size: 16 (ForYou, Following, Search, etc.)
+          emb_size: 128
+
+      Returns:
+          embeddings: [B, S, D]
+      """
+      # 创建 embedding table
+      embedding_table = get_parameter(
+          name,
+          [vocab_size, emb_size],  # [16, 128]
+          init=VarianceScaling(1.0)
+      )
+
+      # One-hot + 矩阵乘法 (等价于查表)
+      input_one_hot = one_hot(input, vocab_size)  # [B, S, 16]
+      output = dot(input_one_hot, embedding_table)  # [B, S, 128]
+
+      return output
+
+  ---
+  📦 完整的数据流
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                   EMBEDDINGS 生成流程                            │
+  ├──────────────────────────────────────────────────────────────────┤
+  │                                                                  │
+  │  1. USER EMBEDDINGS                                              │
+  │     user_id → hash函数 → [h1, h2]                                │
+  │                           ↓                                      │
+  │                    Embedding Tables                              │
+  │                    [100K, 128]                                   │
+  │                           ↓                                      │
+  │                    [emb1, emb2] → Linear → [user_emb]            │
+  │                    [B, 2, 128]          → [B, 1, 128]            │
+  │                                                                  │
+  │  2. POST EMBEDDINGS (历史 & 候选)                                │
+  │     post_id → hash函数 → [h1, h2]                                │
+  │                           ↓                                      │
+  │                    Embedding Tables                              │
+  │                    [100K, 128]                                   │
+  │                           ↓                                      │
+  │                    [emb1, emb2]                                  │
+  │                    [B, S, 2, 128]                                │
+  │                                                                  │
+  │  3. AUTHOR EMBEDDINGS (历史 & 候选)                              │
+  │     author_id → hash函数 → [h1, h2]                              │
+  │                           ↓                                      │
+  │                    Embedding Tables                              │
+  │                    [100K, 128]                                   │
+  │                           ↓                                      │
+  │                    [emb1, emb2]                                  │
+  │                    [B, S, 2, 128]                                │
+  │                                                                  │
+  │  4. ACTION EMBEDDINGS                                            │
+  │     action_vector=[1,0,1,0,...]                                  │
+  │     [B, S, 19]                                                   │
+  │          ↓                                                       │
+  │     Learnable Projection Matrix                                 │
+  │     [19, 128]                                                    │
+  │          ↓                                                       │
+  │     [B, S, 128]                                                  │
+  │                                                                  │
+  │  5. PRODUCT SURFACE EMBEDDINGS                                   │
+  │     surface_id (0-15)                                            │
+  │     [B, S]                                                       │
+  │          ↓                                                       │
+  │     Embedding Table                                              │
+  │     [16, 128]                                                    │
+  │          ↓                                                       │
+  │     [B, S, 128]                                                  │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ---
+  🔑 关键点
+
+  1. Hash-based Embeddings 的优势
+
+  使用多个哈希函数（如 2 个）的原因：
+  - ✅ 减少碰撞: 降低不同 ID 映射到同一个 embedding 的概率
+  - ✅ 减少内存: 不需要为每个 user/post/author 都存一个 embedding
+  - ✅ 泛化能力: 新用户/推文可以立即获得 embedding
+
+  2. Action Embeddings 的特殊性
+
+  为什么 action 不用 hash，而用投影矩阵？
+  - ✅ Action 类型是固定且有限的（只有19种）
+  - ✅ Multi-hot vector 可以表达多个同时发生的行为
+  - ✅ Signed projection (2*x-1) 可以区分"有"和"无"
+
+  3. Embedding 维度
+
+  user_hashes:   [B, 2]      → user_embeddings:   [B, 2, 128] → [B, 1, 128]
+  post_hashes:   [B, S, 2]   → post_embeddings:   [B, S, 2, 128]
+  author_hashes: [B, S, 2]   → author_embeddings: [B, S, 2, 128]
+  actions:       [B, S, 19]  → action_embeddings: [B, S, 128]
+  surface:       [B, S]      → surface_embeddings:[B, S, 128]
+
+  这就是所有 embeddings 的生成方式！核心是 Hash Lookup + Learnable Projection。
