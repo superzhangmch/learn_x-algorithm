@@ -51,7 +51,7 @@ We have eliminated every single hand-engineered feature and most heuristics from
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
 │   │                                   QUERY HYDRATION                                   │   │
 │   │  ┌──────────────────────────┐    ┌──────────────────────────────────────────────┐   │   │
-│   │  │ User Action Sequence     │    │ User Features                                │   │   │
+│   │  │ User Action Sequence     │    │ User Features                                │   │   │ # 用户行为, 以及用户属性信息获取, 为推荐召回作准备
 │   │  │ (engagement history)     │    │ (following list, preferences, etc.)          │   │   │
 │   │  └──────────────────────────┘    └──────────────────────────────────────────────┘   │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
@@ -60,23 +60,23 @@ We have eliminated every single hand-engineered feature and most heuristics from
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
 │   │                                  CANDIDATE SOURCES                                  │   │
 │   │         ┌─────────────────────────────┐    ┌────────────────────────────────┐       │   │
-│   │         │        THUNDER              │    │     PHOENIX RETRIEVAL          │       │   │
+│   │         │        THUNDER              │    │     PHOENIX RETRIEVAL          │       │   │ # THUNDER - 基于社交图的直接索引召回（In-Network), 召回你关注的人的推文
 │   │         │    (In-Network Posts)       │    │   (Out-of-Network Posts)       │       │   │
-│   │         │                             │    │                                │       │   │
-│   │         │  Posts from accounts        │    │  ML-based similarity search    │       │   │
-│   │         │  you follow                 │    │  across global corpus          │       │   │
+│   │         │                             │    │                                │       │   │ # PHOENIX RETRIEVAL - 基于 Embedding 的相似度召回（Out-of-Network）
+│   │         │  Posts from accounts        │    │  ML-based similarity search    │       │   │   - Two-Tower 模型(怎么做的?)
+│   │         │  you follow                 │    │  across global corpus          │       │   │ 
 │   │         └─────────────────────────────┘    └────────────────────────────────┘       │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                              │                                              │
 │                                              ▼                                              │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
 │   │                                      HYDRATION                                      │   │
-│   │  Fetch additional data: core post metadata, author info, media entities, etc.       │   │
+│   │  Fetch additional data: core post metadata, author info, media entities, etc.       │   │ # 上一步应该只是召回的推文id这样简单信息, 需要补充每一推文的详细信息
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                              │                                              │
 │                                              ▼                                              │
 │   ┌─────────────────────────────────────────────────────────────────────────────────────┐   │
-│   │                                      FILTERING                                      │   │
+│   │                                      FILTERING                                      │   │ # 排序前的过滤
 │   │  Remove: duplicates, old posts, self-posts, blocked authors, muted keywords, etc.   │   │
 │   └─────────────────────────────────────────────────────────────────────────────────────┘   │
 │                                              │                                              │
