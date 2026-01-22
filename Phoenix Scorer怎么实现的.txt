@@ -1,0 +1,104 @@
+# ==== Phoenix Scorer
+
+大体上说, 把用户已经用户的历史, 都是分别当作一个 token(或者所占据一个token位置), 以 embedding 的形式给到 transformer. 而被排序的posts, 也是分别以占据一个 token 位置 的 embedding 的形式, 给到 transformer. 
+
+user, user-history, 被排序posts(candidates), 每个都当作一个 token 拼接后, 形成 transformer 的 context (或者说 prompt) 区域. 而 输出结果, 则是candidates对应位置的 logits 输出上做19个维度的独立预测. 这样子, Phoenix Scorer 中的 transformer 其实并不是首位接龙那样做生成. 而是一次性得到预测结果. 
+
+Phoenix Scorer 本质上是用Transformer做parallel encoding + classification，而不是sequence generation。这种设计是推荐系统场景的优化：需要快速给成百上千个候选打分，而不是生成新内容
+
+(1). 输入构造
+
+  Phoenix Scorer将推荐任务转换为序列编码问题：
+
+  1. 用户表示：1个token位置，embedding维度128
+     - User embedding 很简单，只是用户身份的表示。用户的偏好/兴趣信息是通过 History 序列 隐式编码的，由 Transformer 在 attention 过程中学习。
+  3. 历史交互序列：最多X(比如128)个token位置，每个代表用户过去看过并有交互的post
+     - 每个history位置 = 一条交互记录： 《"用户在 [某界面] 上看到 [某作者] 的 [某post]，并做了 [这些行为]"》, 4 部分信息 concat 成 768维，再线性投影到 128维.
+     - 四部分: post + author + actions + surface(界面)
+  4. 待排序候选集：最多X(比如32)个token位置，每个代表需要打分的candidate post
+     - 每个 candidate embed 编码了三部分: post + author + surface
+     - model 其实做的不过是: 基于用于的历史 [post + author + actions + surface] 序列, 预测当下 post + author + surface 情况下的 actions
+
+  这三部分在序列维度上拼接，形成长度为161（1+128+32）的输入序列，每个位置都是128维的embedding向量。
+
+  可以看到关键在于user/hist/candidate 的表示. 那么, user, history, candidate 的 embed, 是scorer train时学出来的, 还是别的地方给到 scorer, scorer 只是利用? 代码库中没说,  claude 说可能后者也不是没可能.
+  
+(2). Transformer处理
+  这个161长度的序列作为Transformer的完整输入（类似于"prompt"），经过多层transformer编码后，得到相同shape的输出表示 [B, 161, 128]。
+
+(3). 输出提取
+  模型只使用候选区域（第129-161位置）的输出embeddings，将这32个128维向量通过unembedding矩阵投影到19维动作空间，得到最终输出 [B,32,19]。
+  
+(4). 关键特点
+
+  这不是自回归生成模型：
+  - 不是逐个token生成下一个词
+  - 而是单次前向传播，并行计算所有候选的得分
+  - 每个候选同时输出19个动作的预测概率（like、reply、retweet等）
+               
+  这是编码+分类架构：
+  - Transformer作为编码器理解"用户+历史+候选"的整体语义
+  - 输出层对候选位置做多标签分类（19个维度的独立预测）
+
+  用transformer的表征能力做ranking，而不是做generation。
+
+# ====  Intermediate Tensors (Inside Model)
+
+  After Hash Reduction: 
+  user_embedding:      [B, 1, 128]   # Combined from [B, 2, 128]
+  history_embeddings:  [B, 128, 128] # Combined from posts + authors + actions + surface
+  candidate_embeddings: [B, 32, 128] # Combined from posts + authors + surface
+
+  Transformer Input (recsys_model.py:428-437):
+  embeddings = concat([user, history, candidates], axis=1)
+  # Shape: [B, 161, 128]  (1 + 128 + 32 = 161 sequence length)
+
+  padding_mask: [B, 161]  # Boolean mask
+
+  candidate_start_offset = 129  # Position where candidates begin
+
+  Attention Mask (grok.py:62):
+  attn_mask: [1, 1, 161, 161]  # Candidate isolation pattern
+
+# ====  Output Tensors
+
+  Model Output (RecsysModelOutput):
+  ┌────────┬─────────────┬──────────────────────────────────┐
+  │ Field  │    Shape    │           Description            │
+  ├────────┼─────────────┼──────────────────────────────────┤
+  │ logits │ [B, 32, 19] │ Action logits for each candidate │
+  └────────┴─────────────┴──────────────────────────────────┘
+  After Softmax/Sigmoid:
+  probabilities: [B, 32, 19]  # P(action) for each candidate
+
+  Where the 19 actions map to (from recsys_model.py:451):
+  [P(like), P(reply), P(repost), P(quote), P(click), P(profile_click),
+   P(vqv), P(photo_expand), P(share), P(share_via_dm), P(share_via_copy_link),
+   P(dwell), P(follow), P(not_interested), P(block), P(mute), P(report),
+   P(quoted_click), dwell_time]
+
+
+# ====  Example: Concrete Dimensions
+
+  With typical values (B=1, S=128, C=32, D=128):
+
+  # Input
+  user_hashes:              [1, 2]
+  history_post_hashes:      [1, 128, 2]
+  candidate_post_hashes:    [1, 32, 2]
+
+  # Transformer Input (concatenated)
+  transformer_input:        [1, 161, 128]
+                            # ↑   ↑    ↑
+                            # B   1+S+C  D
+
+  # Output
+  logits:                   [1, 32, 19]
+                            # ↑   ↑   ↑
+                            # B   C   num_actions
+
+  Key Files:
+  - Shape definitions: phoenix/recsys_model.py:79-243
+  - Config defaults: phoenix/recsys_model.py:246-254
+  - Example usage: phoenix/run_ranker.py:26-29
+
